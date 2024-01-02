@@ -1,0 +1,1365 @@
+<!doctype html>
+
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Fluid simulation</title>
+  </head>
+  <body>
+    <canvas id="canvas" width="800" height="800"></canvas>
+    <script type="module">
+
+const DIFFUSE = 0.0;
+const VISCOSITY = 0;
+var DIFFUSE_STATE = DIFFUSE;
+const N = 256;
+const GRID_SIZE = N + 2;
+const COLOR_RADIUS = 3;
+const VELOCITY_RADIUS = 1;
+
+const WORKGROUP_SIZE = 4;
+const UPDATE_INTERVAL = 30;
+let step = 0;
+let densityStep = 0;
+let velocityStep = 0;
+var mousePosition = {x : 0, y:0, x0: 0, y0:0 };
+var encoder;
+var commandBuffer;
+
+var canvas=document.getElementById("canvas");
+var width = canvas.width;
+var height = canvas.height;
+let timer
+canvas.addEventListener('mousemove', function(e) {
+    var newPos = getMousePos(canvas, e);
+    mousePosition.x0 = mousePosition.x;
+    mousePosition.y0 = mousePosition.y;
+    mousePosition.x = newPos.x;
+    mousePosition.y = newPos.y;
+
+    clearTimeout(timer)
+    timer = setTimeout(mouse_stopped, 50)
+}, false);
+
+function mouse_stopped(){
+    mousePosition.x0 = mousePosition.x;
+    mousePosition.y0 = mousePosition.y;
+}
+
+function getMousePos(canvas, e) {
+    var rect = canvas.getBoundingClientRect();
+    return {x: e.clientX - rect.left, y: e.clientY - rect.top};
+}
+
+async function init() {
+    const canvas = document.querySelector("canvas");
+
+    // Your WebGPU code will begin here!
+    if (!navigator.gpu) {
+        throw new Error("WebGPU not supported on this browser.");
+    }
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+        throw new Error("No appropriate GPUAdapter found.");
+    }
+
+    const device = await adapter.requestDevice();
+    const context = canvas.getContext("webgpu");
+    const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({
+        device: device,
+        format: canvasFormat,
+    });
+    return {"device": device, "canvasFormat": canvasFormat, "context": context };
+}
+
+function squareShape(gpuInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+    const vertices = new Float32Array([
+      -1, -1, 0, 0,
+       1, -1, 1, 0,
+       1,  1, 1, 1,
+
+      -1, -1, 0, 0,
+       1,  1, 1, 1,
+      -1,  1, 0, 1,
+    ]);
+
+    const vertexBuffer = device.createBuffer({
+      label: "Cell vertices",
+      size: vertices.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(vertexBuffer, /*bufferOffset=*/0, vertices);
+
+    const vertexBufferLayout = {
+      arrayStride: 16,
+      attributes: [{
+        format: "float32x2",
+        offset: 0,
+        shaderLocation: 0, // Position, see vertex shader
+      }, 
+      {
+        format: "float32x2",
+        offset: 8,
+        shaderLocation: 1, // uv, see vertex shader
+      }],
+    };
+    return {"vertices": vertices, "vertexBuffer" : vertexBuffer, "vertexBufferLayout" : vertexBufferLayout };
+}
+
+function createSquarePipeline(squareInfo, gpuInfo, pipelineInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+      const squareShaderModule = device.createShaderModule({
+        label: "square shader",
+        code: `
+          struct VertexInput {
+            @location(0) position: vec2f,
+            @location(1) uv: vec2f,
+          };
+          struct VertexOutput {
+            @builtin(position) position: vec4f,
+            @location(0) uv: vec2f,
+          };
+
+          struct Uniforms {
+              mouse: vec2f,
+              grid_size: vec2f,
+              diff: f32, visc: f32,
+              N: f32, dt: f32, b: f32,
+          };
+
+          @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+          @group(0) @binding(1) var<storage> colorSource: array<vec4f>;
+
+          @vertex
+          fn vertexMain(input: VertexInput,
+                        @builtin(instance_index) instance: u32) -> VertexOutput {
+            var output: VertexOutput;
+            output.position = vec4f(input.position, 0, 1);
+            output.uv = input.uv;
+            return output;
+          }
+
+          @fragment
+          fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+            var cell = floor(input.uv * uniforms.N);
+            var i = cell.x + 1;
+            var j = cell.y + 1;
+            var index = i32(i + j * uniforms.grid_size.x);
+            var color = colorSource[index]; 
+            return vec4f(color);
+            //return vec4(0.5) + 0.5 * vec4f(color);
+          }
+        `
+      });
+
+        const bindGroupLayout = device.createBindGroupLayout({
+          label: "Square Bind Group Layout",
+          entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.VERTEX |  GPUShaderStage.FRAGMENT,
+            buffer: {}
+          },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.VERTEX |  GPUShaderStage.FRAGMENT,
+            buffer: { type: "read-only-storage"}
+          }
+            ]
+        });
+        const pipelineLayout = device.createPipelineLayout({
+          label: "Square Pipeline Layout",
+          bindGroupLayouts: [ bindGroupLayout ]
+        });
+
+
+      // Create a pipeline that renders the cell.
+      const squarePipeline = device.createRenderPipeline({
+        label: "square pipeline",
+        layout: pipelineLayout,
+        vertex: {
+          module: squareShaderModule,
+          entryPoint: "vertexMain",
+          buffers: [squareInfo.vertexBufferLayout]
+        },
+        fragment: {
+          module: squareShaderModule,
+          entryPoint: "fragmentMain",
+          targets: [{
+            format: canvasFormat
+          }]
+        }
+      });
+    return { layout : bindGroupLayout, program: squarePipeline };
+}
+
+function createAddDensityPipeline(gpuInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+     // Create the compute shader that will process the game of life simulation.
+      const shaderModule = device.createShaderModule({
+        label: "Add density simulation shader",
+        code: `
+          struct Uniforms {
+              mouse: vec2f,
+              grid_size: vec2f,
+              diff: f32, visc: f32,
+              N: f32, dt: f32, b: f32,
+          };
+
+          struct Source {
+            color: vec4f,
+            radius: f32,
+          };
+
+
+          @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+          @group(0) @binding(1) var<storage, read_write> stateOut: array<vec4f>;
+          @group(0) @binding(2) var<storage> stateIn: array<vec4f>;
+          @group(0) @binding(3) var<uniform> source: Source;
+
+          @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+          fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
+            var index = (global_id.x + 1) + u32(uniforms.grid_size.x) * (global_id.y + 1);
+            stateOut[index] = stateIn[index];
+            if(length(vec2f(uniforms.mouse) - vec2f((vec2f(global_id.xy) + vec2f(1)))) < source.radius) {
+                stateOut[index] += source.color;
+            }
+          }
+        `
+      });
+
+        const bindGroupLayout = device.createBindGroupLayout({
+          label: "Add Density Bind Group Layout",
+          entries: [
+              {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: {}
+              },
+              {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "storage"}
+              },
+              {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "read-only-storage"}
+              },
+              {
+                binding: 3,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: {}
+              },
+            ]
+        });
+        const pipelineLayout = device.createPipelineLayout({
+          label: "Square Pipeline Layout",
+          bindGroupLayouts: [ bindGroupLayout ]
+        });
+
+
+      // Create a compute pipeline that updates the game state.
+      const pipeline = device.createComputePipeline({
+        label: "set_bnd pipeline",
+        layout: pipelineLayout,
+        compute: {
+          module: shaderModule,
+          entryPoint: "computeMain",
+        }
+      });
+
+    return { layout : bindGroupLayout, program: pipeline };
+}
+
+function createBndPipeline(gpuInfo, pipelineInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+     // Create the compute shader that will process the game of life simulation.
+      const shaderModule = device.createShaderModule({
+        label: "set_bnd simulation shader",
+        code: `
+          struct Uniforms {
+              mouse: vec2f,
+              grid_size: vec2f,
+              diff: f32,
+              visc: f32,
+              N: f32, dt: f32,
+              b: f32,
+          };
+
+          fn IX(x: u32, y: u32) -> u32 {
+            var grid = uniforms.grid_size;
+            return y * u32(grid.x) + x;
+          }
+
+          @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+          @group(0) @binding(1) var<storage, read_write> arr: array<vec4f>;
+
+
+          @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+          fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
+            var i = global_id.x;
+            var j = global_id.y;
+            var index = IX(i,j);
+            var N = u32(uniforms.N);
+            if(f32(i) >= uniforms.grid_size.x) {
+                return;
+            }
+            if(f32(j) >= uniforms.grid_size.y) {
+                return;
+            }
+            
+            if(u32(uniforms.b) == 0) {
+                if(i == 0) {
+                    arr[index] = arr[IX(1, j)];
+                }            
+                if(i == u32(N + 1)) {
+                    arr[index] = arr[IX(N, j)];
+                }            
+                if(j == 0) {
+                    arr[index] = arr[IX(i, 1)];
+                }            
+                if(j == u32(N+1)) {
+                    arr[index] = arr[IX(i, N)];
+                }            
+            } else {
+                if(i == 0) {
+                    arr[index] = arr[IX(1, j)];
+                    arr[index].x *= -1;
+                }
+                if(i == u32(N + 1)) {
+                    arr[index] = arr[IX(N, j)];
+                    arr[index].x *= -1;
+                }            
+                if(j == 0) {
+                    arr[index] = arr[IX(i, 1)];
+                    arr[index].y *= -1;
+                }            
+                if(j == u32(N + 1)) {
+                    arr[index] = arr[IX(i, N)];
+                    arr[index].y *= -1;
+                }            
+            }
+          }
+        `
+      });
+
+        const bindGroupLayout = device.createBindGroupLayout({
+          label: "Diffuse Bind Group Layout",
+          entries: [
+              {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: {}
+              },
+              {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "storage"}
+              },
+            ]
+        });
+        const pipelineLayout = device.createPipelineLayout({
+          label: "advect Pipeline Layout",
+          bindGroupLayouts: [ bindGroupLayout ]
+        });
+
+
+      const pipeline = device.createComputePipeline({
+        label: "diffuse pipeline",
+        layout: pipelineLayout,
+        compute: {
+          module: shaderModule,
+          entryPoint: "computeMain",
+        }
+      });
+
+    return { layout : bindGroupLayout, program: pipeline };
+}
+
+function createDiffusePipeline(gpuInfo, pipelineInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+     // Create the compute shader that will process the game of life simulation.
+      const shaderModule = device.createShaderModule({
+        label: "Add density simulation shader",
+        code: `
+          struct Uniforms {
+              mouse: vec2f,
+              grid_size: vec2f,
+              diffuse: f32, viscosity: f32,
+              N: f32, dt: f32, b: f32,
+          };
+
+          @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+          @group(0) @binding(1) var<storage, read_write> x: array<vec4f>;
+          @group(0) @binding(2) var<storage> x0: array<vec4f>;
+
+          fn cellIndex(cell: vec2u, grid: vec2f) -> u32 {
+            return (cell.y + 1) * u32(grid.x) +
+                   (cell.x + 1);
+          }
+          fn getColorNew(cell: vec2i) -> vec4f {
+            var index = cellIndex(vec2u(cell), uniforms.grid_size);
+            return x[index];
+          }
+
+          fn getColorPrev(cell: vec2i) -> vec4f {
+            var index = cellIndex(vec2u(cell), uniforms.grid_size);
+            return x0[index];
+          }
+
+          @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+          fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
+            var dt = uniforms.dt;
+            var diff = uniforms.diffuse;
+            var a = dt * diff * (uniforms.grid_size.x -2) * (uniforms.grid_size.x - 2);
+            var index = cellIndex(global_id.xy, uniforms.grid_size.xy);
+            var color = getColorPrev(vec2i(global_id.xy));
+                color += a * (getColorNew(vec2i(global_id.xy) + vec2i( 0, 1)) +
+                             getColorNew(vec2i(global_id.xy) + vec2i( 0,-1)) +
+                             getColorNew(vec2i(global_id.xy) + vec2i( 1, 0)) +
+                             getColorNew(vec2i(global_id.xy) + vec2i(-1, 0)));
+            x[index] = color / (1 + 4 * a);
+          }
+        `
+      });
+        const bindGroupLayout = device.createBindGroupLayout({
+          label: "Diffuse Bind Group Layout",
+          entries: [
+              {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: {}
+              },
+              {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "storage"}
+              },
+              {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "read-only-storage"}
+              }
+            ]
+        });
+        const pipelineLayout = device.createPipelineLayout({
+          label: "Square Pipeline Layout",
+          bindGroupLayouts: [ bindGroupLayout ]
+        });
+
+
+      // Create a compute pipeline that updates the game state.
+      const pipeline = device.createComputePipeline({
+        label: "diffuse pipeline",
+        layout: pipelineLayout,
+        compute: {
+          module: shaderModule,
+          entryPoint: "computeMain",
+        }
+      });
+
+    return { layout : bindGroupLayout, program: pipeline };
+}
+function createAdvectPipeline(gpuInfo, pipelineInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+     // Create the compute shader that will process the game of life simulation.
+      const shaderModule = device.createShaderModule({
+        label: "Add density simulation shader",
+        code: `
+          struct Uniforms {
+              mouse: vec2f,
+              grid_size: vec2f,
+              diffuse: f32,
+              viscosity: f32,
+              N: f32, dt: f32, b: f32,
+          };
+
+          @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+          @group(0) @binding(1) var<storage, read_write> d: array<vec4f>;
+          @group(0) @binding(2) var<storage>             d0: array<vec4f>;
+          @group(0) @binding(3) var<storage>             uv: array<vec4f>;
+
+          fn IX(cell: vec2u) -> u32 {
+            var grid = uniforms.grid_size;
+            return (cell.y ) * u32(grid.x) + (cell.x );
+          }
+          fn IXf(x: f32, y: f32) -> u32 {
+            return IX(vec2u(u32(x), u32(y)));
+          }
+
+          @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+          fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
+            var dt = uniforms.dt;
+            var N = uniforms.N;
+            var grid = uniforms.grid_size;
+            var index = IX(global_id.xy + vec2u(1));
+            var dt0 = dt*N;
+            var i = f32(global_id.x + 1);
+            var j = f32(global_id.y + 1);
+                    var x = i-dt0*uv[IXf(i,j)].x;
+                    var y = j-dt0*uv[IXf(i,j)].y;
+
+                    if (x<0.5) { x=0.5; }
+                    if (x>N+0.5) { x=N+ 0.5; }
+                    var i0 = floor(x); 
+                    var i1 = i0+1;
+
+                    if (y<0.5) {y=0.5;}
+                    if (y>N+0.5) {y=N+ 0.5;}
+                    var j0 = floor(y);
+                    var j1 = j0+1;
+
+                    var s1 = x-f32(i0);
+                    var s0 = 1-s1;
+                    var t1 = y-f32(j0);
+                    var t0 = 1-t1;
+
+
+                    d[IXf(i,j)] = s0*(t0*d0[IXf(i0,j0)]+t1*d0[IXf(i0,j1)])+
+                                  s1*(t0*d0[IXf(i1,j0)]+t1*d0[IXf(i1,j1)]);
+
+          }
+        `
+      });
+        const bindGroupLayout = device.createBindGroupLayout({
+          label: "Diffuse Bind Group Layout",
+          entries: [
+              {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: {}
+              },
+              {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "storage"}
+              },
+              {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "read-only-storage"}
+              },
+              {
+                binding: 3,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "read-only-storage"}
+              }
+            ]
+        });
+        const pipelineLayout = device.createPipelineLayout({
+          label: "advect Pipeline Layout",
+          bindGroupLayouts: [ bindGroupLayout ]
+        });
+
+
+      // Create a compute pipeline that updates the game state.
+      const pipeline = device.createComputePipeline({
+        label: "diffuse pipeline",
+        layout: pipelineLayout,
+        compute: {
+          module: shaderModule,
+          entryPoint: "computeMain",
+        }
+      });
+
+    return { layout : bindGroupLayout, program: pipeline };
+}
+
+function createProjectPipeline_1(gpuInfo, pipelineInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+     // Create the compute shader that will process the game of life simulation.
+      const shaderModule = device.createShaderModule({
+        label: "Add density simulation shader",
+        code: `
+          struct Uniforms {
+              mouse: vec2f,
+              grid_size: vec2f,
+              diffuse: f32,
+              viscosity: f32,
+              N: f32, dt: f32, b: f32,
+          };
+
+          @group(0) @binding(0) var<uniform>             uniforms: Uniforms;
+          @group(0) @binding(1) var<storage> uv: array<vec4f>;
+          @group(0) @binding(2) var<storage, read_write> p_div: array<vec4f>;
+
+          fn IX(x: u32, y: u32) -> u32 {
+            var grid = uniforms.grid_size;
+            return y * u32(grid.x) + x;
+          }
+
+          @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+          fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
+            var dt = uniforms.dt;
+            var N = uniforms.N;
+            var grid = uniforms.grid_size;
+            var h = 1 / N;
+            var i = global_id.x + 1;
+            var j = global_id.y + 1;
+            p_div[IX(i,j)].x = 0;
+            p_div[IX(i,j)].y = -0.5*h*(uv[IX(i+1,j)].x-uv[IX(i-1,j)].x +
+                                       uv[IX(i,j+1)].y-uv[IX(i,j-1)].y);
+
+          }
+        `
+      });
+        const bindGroupLayout = device.createBindGroupLayout({
+          label: "Diffuse Bind Group Layout",
+          entries: [
+              {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: {}
+              },
+              {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "read-only-storage"}
+              },
+              {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "storage"}
+              },
+            ]
+        });
+        const pipelineLayout = device.createPipelineLayout({
+          label: "advect Pipeline Layout",
+          bindGroupLayouts: [ bindGroupLayout ]
+        });
+
+
+      // Create a compute pipeline that updates the game state.
+      const pipeline = device.createComputePipeline({
+        label: "diffuse pipeline",
+        layout: pipelineLayout,
+        compute: {
+          module: shaderModule,
+          entryPoint: "computeMain",
+        }
+      });
+
+    return { layout : bindGroupLayout, program: pipeline };
+}
+
+function createProjectPipeline_2(gpuInfo, pipelineInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+     // Create the compute shader that will process the game of life simulation.
+      const shaderModule = device.createShaderModule({
+        label: "Add density simulation shader",
+        code: `
+          struct Uniforms {
+              mouse: vec2f,
+              grid_size: vec2f,
+              diffuse: f32,
+              viscosity: f32,
+              N: f32, dt: f32, b: f32,
+          };
+
+          @group(0) @binding(0) var<uniform>             uniforms: Uniforms;
+          @group(0) @binding(1) var<storage> uv: array<vec4f>;
+          @group(0) @binding(2) var<storage, read_write> p_div: array<vec4f>;
+
+          fn IX(x: u32, y: u32) -> u32 {
+            var grid = uniforms.grid_size;
+            return y * u32(grid.x) + x;
+          }
+
+          @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+          fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
+            var dt = uniforms.dt;
+            var N = uniforms.N;
+            var grid = uniforms.grid_size;
+            var h = 1 / N;
+            var i = global_id.x + 1;
+            var j = global_id.y + 1;
+            p_div[IX(i,j)].x = (p_div[IX(i,j)].y+p_div[IX(i-1,j)].x+p_div[IX(i+1,j)].x+
+                                       p_div[IX(i,j-1)].x+p_div[IX(i,j+1)].x)/4;
+
+          }
+        `
+      });
+        const bindGroupLayout = device.createBindGroupLayout({
+          label: "Diffuse Bind Group Layout",
+          entries: [
+              {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: {}
+              },
+              {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "read-only-storage"}
+              },
+              {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "storage"}
+              },
+            ]
+        });
+        const pipelineLayout = device.createPipelineLayout({
+          label: "advect Pipeline Layout",
+          bindGroupLayouts: [ bindGroupLayout ]
+        });
+
+
+      // Create a compute pipeline that updates the game state.
+      const pipeline = device.createComputePipeline({
+        label: "diffuse pipeline",
+        layout: pipelineLayout,
+        compute: {
+          module: shaderModule,
+          entryPoint: "computeMain",
+        }
+      });
+
+    return { layout : bindGroupLayout, program: pipeline };
+}
+
+function createProjectPipeline_3(gpuInfo, pipelineInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+     // Create the compute shader that will process the game of life simulation.
+      const shaderModule = device.createShaderModule({
+        label: "Add density simulation shader",
+        code: `
+          struct Uniforms {
+              mouse: vec2f,
+              grid_size: vec2f,
+              diffuse: f32,
+              viscosity: f32,
+              N: f32, dt: f32, b: f32,
+          };
+
+          @group(0) @binding(0) var<uniform>             uniforms: Uniforms;
+          @group(0) @binding(1) var<storage, read_write> uv: array<vec4f>;
+          @group(0) @binding(2) var<storage> p_div: array<vec4f>;
+
+          fn IX(x: u32, y: u32) -> u32 {
+            var grid = uniforms.grid_size;
+            return y * u32(grid.x) + x;
+          }
+
+          @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+          fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
+            var dt = uniforms.dt;
+            var N = uniforms.N;
+            var grid = uniforms.grid_size;
+            var h = 1 / N;
+            var i = global_id.x + 1;
+            var j = global_id.y + 1;
+            uv[IX(i,j)].x -= 1.0*(p_div[IX(i+1,j)].x-p_div[IX(i-1,j)].x)/h;
+            uv[IX(i,j)].y -= 1.0*(p_div[IX(i,j+1)].x-p_div[IX(i,j-1)].x)/h;
+
+          }
+        `
+      });
+        const bindGroupLayout = device.createBindGroupLayout({
+          label: "Diffuse Bind Group Layout",
+          entries: [
+              {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: {}
+              },
+              {
+                binding: 1,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "storage"}
+              },
+              {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "read-only-storage"}
+              },
+            ]
+        });
+        const pipelineLayout = device.createPipelineLayout({
+          label: "advect Pipeline Layout",
+          bindGroupLayouts: [ bindGroupLayout ]
+        });
+
+
+      // Create a compute pipeline that updates the game state.
+      const pipeline = device.createComputePipeline({
+        label: "diffuse pipeline",
+        layout: pipelineLayout,
+        compute: {
+          module: shaderModule,
+          entryPoint: "computeMain",
+        }
+      });
+
+    return { layout : bindGroupLayout, program: pipeline };
+}
+
+function setUniforms(renderInfo, b){
+    var device = renderInfo.gpuInfo.device;
+    var uniformBuffer = renderInfo.buffers.uniformBuffer;
+    var mouseX = mousePosition.x/width * GRID_SIZE;
+    var mouseY = (1.0 - mousePosition.y/width) * GRID_SIZE;
+    var dt = UPDATE_INTERVAL / 1000;
+    var uniformArray = new Float32Array([
+        mouseX, mouseY,
+        GRID_SIZE, GRID_SIZE,
+        DIFFUSE_STATE, 0,
+        N, dt,
+        b, 0
+    ]);
+    device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
+}
+
+function addSource(renderInfo, x, x0, buffer) {
+    var buffers = renderInfo.buffers;
+    var pipeline = renderInfo.shaders.addDensityPipeline;
+    var device = renderInfo.gpuInfo.device;
+    var context = renderInfo.gpuInfo.context;
+    
+    var bindGroup = device.createBindGroup({
+          label: "Cell renderer bind group A",
+          layout: pipeline.layout,
+          entries: [
+              {
+                binding: 0,
+                resource: { buffer: buffers.uniformBuffer }
+              },
+              {
+                binding: 1,
+                resource: { buffer: x }
+              },
+              {
+                binding: 2,
+                resource: { buffer: x0 }
+              },
+              {
+                binding: 3,
+                resource: { buffer }
+              },
+            ],
+        });
+    encoder = device.createCommandEncoder();
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(pipeline.program);
+    computePass.setBindGroup(0, bindGroup);
+    const workgroupCount = Math.ceil(N / WORKGROUP_SIZE);
+    computePass.dispatchWorkgroups(workgroupCount, workgroupCount);
+    computePass.end();
+    commandBuffer = encoder.finish();
+    device.queue.submit([commandBuffer]);
+}
+function diffuse(renderInfo, b, x, x0, diffuse) {
+    var buffers = renderInfo.buffers;
+    var pipeline = renderInfo.shaders.diffusePipeline;
+    var device = renderInfo.gpuInfo.device;
+    var context = renderInfo.gpuInfo.context;
+    var bindGroup = device.createBindGroup({
+          label: "diffuse bind group",
+          layout: pipeline.layout,
+          entries: [
+              {
+                binding: 0,
+                resource: { buffer: buffers.uniformBuffer }
+              },
+              {
+                binding: 1,
+                resource: { buffer: x }
+              },
+              {
+                binding: 2,
+                resource: { buffer: x0 }
+              },
+            ],
+        });
+
+    encoder = device.createCommandEncoder();
+
+    for(var i = 0; i < 20; i++) {
+        const computePass = encoder.beginComputePass();
+        computePass.setPipeline(pipeline.program);
+        computePass.setBindGroup(0, bindGroup);
+        const workgroupCount = Math.ceil(N / WORKGROUP_SIZE);
+        computePass.dispatchWorkgroups(workgroupCount, workgroupCount);
+        computePass.end();
+
+        set_bnd (encoder, renderInfo, N, b, x );
+    }
+    commandBuffer = encoder.finish();
+    device.queue.submit([commandBuffer]);
+}
+
+function set_bnd(encoder, renderInfo, N, b, x) {
+    var buffers = renderInfo.buffers;
+    var pipeline = renderInfo.shaders.bndPipeline;
+    var device = renderInfo.gpuInfo.device;
+    var context = renderInfo.gpuInfo.context;
+    
+    setUniforms(renderInfo, b);
+
+    var bindGroup = device.createBindGroup({
+          label: "Cell renderer bind group A",
+          layout: pipeline.layout,
+          entries: [
+              {
+                binding: 0,
+                resource: { buffer: buffers.uniformBuffer }
+              },
+              {
+                binding: 1,
+                resource: { buffer: x }
+              },
+            ],
+        });
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(pipeline.program);
+    computePass.setBindGroup(0, bindGroup);
+    const workgroupCount = Math.ceil((GRID_SIZE) / WORKGROUP_SIZE);
+    //const workgroupCount = Math.ceil((N) / WORKGROUP_SIZE);
+    computePass.dispatchWorkgroups(workgroupCount, workgroupCount);
+    computePass.end();
+}
+
+
+function advect(renderInfo, b, d, d0, uv) {
+    var buffers = renderInfo.buffers;
+    var pipeline = renderInfo.shaders.advectPipeline;
+    var device = renderInfo.gpuInfo.device;
+    var context = renderInfo.gpuInfo.context;
+    
+    var bindGroup = device.createBindGroup({
+          label: "Cell renderer bind group A",
+          layout: pipeline.layout,
+          entries: [
+              {
+                binding: 0,
+                resource: { buffer: buffers.uniformBuffer }
+              },
+              {
+                binding: 1,
+                resource: { buffer: d }
+              },
+              {
+                binding: 2,
+                resource: { buffer: d0 }
+              },
+              {
+                binding: 3,
+                resource: { buffer: uv }
+              },
+            ],
+        });
+
+    encoder = device.createCommandEncoder();
+
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(pipeline.program);
+    computePass.setBindGroup(0, bindGroup);
+    const workgroupCount = Math.ceil(N / WORKGROUP_SIZE);
+    computePass.dispatchWorkgroups(workgroupCount, workgroupCount);
+    computePass.end();
+
+    set_bnd (encoder, renderInfo, N, b, d);
+    commandBuffer = encoder.finish();
+    device.queue.submit([commandBuffer]);
+}
+
+
+function project(renderInfo, uv, p_div) {
+    var buffers = renderInfo.buffers;
+    var pipeline_1 = renderInfo.shaders.projectPipeline_1;
+    var pipeline_2 = renderInfo.shaders.projectPipeline_2;
+    var pipeline_3 = renderInfo.shaders.projectPipeline_3;
+    var device = renderInfo.gpuInfo.device;
+    var context = renderInfo.gpuInfo.context;
+    
+    var bindGroup_1 = device.createBindGroup({
+          label: "Cell renderer bind group A",
+          layout: pipeline_1.layout,
+          entries: [
+              {
+                binding: 0,
+                resource: { buffer: buffers.uniformBuffer }
+              },
+              {
+                binding: 1,
+                resource: { buffer: uv }
+              },
+              {
+                binding: 2,
+                resource: { buffer: p_div }
+              },
+            ],
+        });
+    var bindGroup_2 = device.createBindGroup({
+          label: "Cell renderer bind group A",
+          layout: pipeline_2.layout,
+          entries: [
+              {
+                binding: 0,
+                resource: { buffer: buffers.uniformBuffer }
+              },
+              {
+                binding: 1,
+                resource: { buffer: uv }
+              },
+              {
+                binding: 2,
+                resource: { buffer: p_div }
+              },
+            ],
+        });
+    var bindGroup_3 = device.createBindGroup({
+          label: "Cell renderer bind group A",
+          layout: pipeline_3.layout,
+          entries: [
+              {
+                binding: 0,
+                resource: { buffer: buffers.uniformBuffer }
+              },
+              {
+                binding: 1,
+                resource: { buffer: uv }
+              },
+              {
+                binding: 2,
+                resource: { buffer: p_div }
+              },
+            ],
+        });
+
+
+
+    encoder = device.createCommandEncoder();
+
+    var computePass = encoder.beginComputePass();
+    const workgroupCount = Math.ceil(N / WORKGROUP_SIZE);
+    computePass.setPipeline(pipeline_1.program);
+    computePass.setBindGroup(0, bindGroup_1);
+    computePass.dispatchWorkgroups(workgroupCount, workgroupCount);
+    computePass.end();
+
+    set_bnd (encoder, renderInfo, N, 0, p_div );
+    commandBuffer = encoder.finish();
+    device.queue.submit([commandBuffer]);
+
+
+    encoder = device.createCommandEncoder();
+
+    for(var i = 0; i < 20; i++) {
+        computePass = encoder.beginComputePass();
+        computePass.setPipeline(pipeline_2.program);
+        computePass.setBindGroup(0, bindGroup_2);
+        computePass.dispatchWorkgroups(workgroupCount, workgroupCount);
+        computePass.end();
+        set_bnd (encoder, renderInfo, N, 0, p_div );
+    }
+    commandBuffer = encoder.finish();
+    device.queue.submit([commandBuffer]);
+
+
+
+    encoder = device.createCommandEncoder();
+
+    computePass = encoder.beginComputePass();
+    computePass.setPipeline(pipeline_3.program);
+    computePass.setBindGroup(0, bindGroup_3);
+    computePass.dispatchWorkgroups(workgroupCount, workgroupCount);
+    computePass.end();
+
+    set_bnd (encoder, renderInfo, N, 1, p_div );
+    commandBuffer = encoder.finish();
+    device.queue.submit([commandBuffer]);
+
+}
+
+function densitySwap() {
+    densityStep = (densityStep + 1) % 2;
+}
+function velocitySwap() {
+    velocityStep = (velocityStep + 1) % 2;
+}
+
+function velocity(renderInfo) {
+    var device = renderInfo.gpuInfo.device;
+    DIFFUSE_STATE = VISCOSITY ;
+    var velocityBuffers = renderInfo.buffers.velocityBuffers;
+    velocitySwap();
+
+    var dx = mousePosition.x - mousePosition.x0;
+    var dy = -1 * (mousePosition.y - mousePosition.y0);
+
+    var addSourceArr = new Float32Array([
+        dx, dy, 0, 0,
+        VELOCITY_RADIUS, 0, 0, 0
+    ]);
+
+    device.queue.writeBuffer(buffers.addVelocityBuffer, 0, addSourceArr);
+    if(dx != 0 || dy !=0 ) {
+        addSource(renderInfo, velocityBuffers[velocityStep % 2], velocityBuffers[(velocityStep+1) % 2], buffers.addVelocityBuffer);
+        velocitySwap();
+    }
+
+    diffuse(renderInfo, 1, velocityBuffers[velocityStep % 2], velocityBuffers[(velocityStep+1) % 2], VISCOSITY);
+    velocitySwap();
+
+    /* Project */
+    project(renderInfo, velocityBuffers[velocityStep % 2], velocityBuffers[(velocityStep+1) % 2]);
+    /* Swap */
+    velocitySwap();
+    
+    /* Advect */
+    advect(renderInfo, 1,  velocityBuffers[velocityStep % 2], velocityBuffers[(velocityStep+1) % 2], velocityBuffers[(velocityStep+1) % 2]);
+
+    /* Project */
+    project(renderInfo, velocityBuffers[velocityStep % 2], velocityBuffers[(velocityStep+1) % 2]);
+}
+function density(renderInfo) {
+    var device = renderInfo.gpuInfo.device;
+    DIFFUSE_STATE = DIFFUSE ;
+    var densityBuffers = renderInfo.buffers.densityBuffers;
+    var velocityBuffers = renderInfo.buffers.velocityBuffers;
+    densitySwap();
+
+    /* Add Density */
+    var dx = mousePosition.x - mousePosition.x0;
+    var dy = -1 * (mousePosition.y - mousePosition.y0);
+
+    var r = 0.5 + 0.4 * Math.sin(step/100)
+    var g = 0.5 + 0.4 * Math.sin(step/30)
+    var b = 0.5 + 0.4 * Math.sin(step/50)
+
+    var addSourceArr = new Float32Array([
+        r, g, b, 1,
+        COLOR_RADIUS, 0, 0, 0
+    ]);
+
+    console.log(dx + ", " + dy);
+    if(dx != 0 || dy != 0) {
+        device.queue.writeBuffer(buffers.addDensityBuffer, 0, addSourceArr);
+        addSource(renderInfo, densityBuffers[densityStep % 2], densityBuffers[(densityStep+1) % 2], buffers.addDensityBuffer);
+        densitySwap();
+    }
+
+
+    diffuse(renderInfo, 0, densityBuffers[densityStep % 2], densityBuffers[(densityStep+1) % 2], DIFFUSE);
+    densitySwap();
+
+    advect(renderInfo, 0, densityBuffers[densityStep % 2], densityBuffers[(densityStep+1) % 2], velocityBuffers[velocityStep % 2]);
+}
+
+
+function drawDensity(renderInfo) {
+    var square = renderInfo.squareInfo;
+    var buffers = renderInfo.buffers;
+    var squarePipeline = renderInfo.shaders.squarePipeline;
+    var device = renderInfo.gpuInfo.device;
+    var context = renderInfo.gpuInfo.context;
+    
+    var bindGroup = device.createBindGroup({
+          label: "Cell renderer bind group A",
+          layout: squarePipeline.layout,
+          entries: [
+              {
+                binding: 0,
+                resource: { buffer: buffers.uniformBuffer }
+              },
+              {
+                binding: 1,
+                resource: { buffer: buffers.densityBuffers[densityStep%2] }
+              },
+            ],
+        });
+
+
+    encoder = device.createCommandEncoder();
+
+    const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+            view: context.getCurrentTexture().createView(),
+            clearValue: { r: 0.3, g: 0, b: 0.4, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+        }]
+    });
+
+
+    pass.setPipeline(squarePipeline.program);
+    pass.setVertexBuffer(0, square.vertexBuffer);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(square.vertices.length / 4, 1);
+    pass.end();
+    commandBuffer = encoder.finish();
+    device.queue.submit([commandBuffer]);
+}
+
+function drawVelocity(renderInfo) {
+    var square = renderInfo.squareInfo;
+    var buffers = renderInfo.buffers;
+    var squarePipeline = renderInfo.shaders.squarePipeline;
+    var device = renderInfo.gpuInfo.device;
+    var context = renderInfo.gpuInfo.context;
+    
+    var bindGroup = device.createBindGroup({
+          label: "Cell renderer bind group A",
+          layout: squarePipeline.layout,
+          entries: [
+              {
+                binding: 0,
+                resource: { buffer: buffers.uniformBuffer }
+              },
+              {
+                binding: 1,
+                resource: { buffer: buffers.velocityBuffers[velocityStep%2] }
+              },
+            ],
+        });
+
+
+    encoder = device.createCommandEncoder();
+
+    const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+            view: context.getCurrentTexture().createView(),
+            clearValue: { r: 0.3, g: 0, b: 0.4, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+        }]
+    });
+
+    pass.setPipeline(squarePipeline.program);
+    pass.setVertexBuffer(0, square.vertexBuffer);
+    pass.setBindGroup(0, bindGroup);
+    pass.draw(square.vertices.length / 4, 1);
+    pass.end();
+    commandBuffer = encoder.finish();
+    device.queue.submit([commandBuffer]);
+}
+
+function run(renderInfo) {
+    var gpuInfo = renderInfo.gpuInfo;
+    var device = renderInfo.gpuInfo.device;
+    var encoder;
+    var commandBuffer;
+
+    //encoder = device.createCommandEncoder();
+    //commandBuffer = encoder.finish();
+    //device.queue.submit([commandBuffer]);
+
+
+    setUniforms(renderInfo, 0);
+
+    density(renderInfo);
+
+    velocity(renderInfo);
+
+    drawDensity(renderInfo);
+
+    //drawVelocity(renderInfo);
+
+    step++;
+}
+
+function createBuffers(gpuInfo) {
+    const device = gpuInfo.device;
+    var buffers = {};
+    const uniformBufferSize =
+        2 * 4 + // mouse is 2 32bit floats
+        2 * 4 + // grid is 2 32bit floats
+        1 * 4 + // diff is 1 32bit
+        1 * 4 + // visc is 1 32bit
+        1 * 4 + // N is 1 32bit floats 
+        1 * 4 +  // dt is 1 32bit floats
+        2 * 4;   // b is 1 32bit floats + 1 padding
+
+    const uniformColorSize =
+        4 * 4 + // color is 4 32bit floats
+        4 * 4 // radius is 1 32bit floats
+
+    buffers.uniformBuffer = device.createBuffer({
+        label: "Uniform buffer",
+        size: uniformBufferSize,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+
+    buffers.addDensityBuffer = device.createBuffer({
+        label: "density Uniform buffer",
+        size: uniformColorSize,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    buffers.addVelocityBuffer = device.createBuffer({
+        label: "veloctiy Uniform buffer",
+        size: uniformColorSize,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    const stateArray = new Float32Array(4 * GRID_SIZE * GRID_SIZE);
+
+    buffers.densityBuffers = [
+        device.createBuffer({
+            label: "Density State A",
+            size: stateArray.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        }),
+        device.createBuffer({
+            label: "Density State B",
+            size: stateArray.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        })
+    ];
+
+    buffers.velocityBuffers = [
+        device.createBuffer({
+            label: "Velocity State A",
+            size: stateArray.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        }),
+        device.createBuffer({
+            label: "Velocity State B",
+            size: stateArray.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        })
+    ];
+    return buffers;
+}
+
+var gpuInfo = await init();
+var squareInfo = squareShape(gpuInfo);
+var buffers = createBuffers(gpuInfo);
+var pipelines = {
+                    "squarePipeline" : createSquarePipeline(squareInfo, gpuInfo),
+                    "addDensityPipeline" : createAddDensityPipeline(gpuInfo),
+                    "diffusePipeline" : createDiffusePipeline(gpuInfo),
+                    "advectPipeline" : createAdvectPipeline(gpuInfo),
+                    "projectPipeline_1" : createProjectPipeline_1(gpuInfo),
+                    "projectPipeline_2" : createProjectPipeline_2(gpuInfo),
+                    "projectPipeline_3" : createProjectPipeline_3(gpuInfo),
+                    "bndPipeline" : createBndPipeline(gpuInfo),
+                };
+
+
+var renderInfo = {
+    "gpuInfo" : gpuInfo,
+    "squareInfo" : squareInfo,
+    "shaders" : pipelines,
+    "buffers" : buffers,
+}
+
+setInterval(function() { run(renderInfo); }, UPDATE_INTERVAL);
+//setInterval(function() { run(renderInfo); }, 100);
+
+    </script>
+  </body>
+</html>

@@ -1,0 +1,441 @@
+<!doctype html>
+
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>WebGPU Life</title>
+  </head>
+  <body>
+    <canvas id="canvas" width="800" height="800"></canvas>
+    <script type="module">
+
+const BIRD_NUMBER = 64;
+const WORKGROUP_SIZE = 8;
+const UPDATE_INTERVAL = 30;
+let step = 0;
+var mousePosition = {x : 0, y:0 };
+
+var canvas=document.getElementById("canvas");
+var width = canvas.width;
+var height = canvas.height;
+canvas.addEventListener('mousemove', function(e) {
+    mousePosition = getMousePos(canvas, e);
+}, false);
+
+function getMousePos(canvas, e) {
+    var rect = canvas.getBoundingClientRect();
+    return {x: e.clientX - rect.left, y: e.clientY - rect.top};
+}
+
+async function init() {
+    const canvas = document.querySelector("canvas");
+
+    // Your WebGPU code will begin here!
+    if (!navigator.gpu) {
+        throw new Error("WebGPU not supported on this browser.");
+    }
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) {
+        throw new Error("No appropriate GPUAdapter found.");
+    }
+
+    const device = await adapter.requestDevice();
+    const context = canvas.getContext("webgpu");
+    const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+    context.configure({
+        device: device,
+        format: canvasFormat,
+    });
+    return {"device": device, "canvasFormat": canvasFormat, "context": context };
+}
+
+function birdShape(gpuInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+    const vertices = new Float32Array([
+      -0.3, -0.8,
+       0.3, -0.8,
+       0.3,  0.1,
+
+      -0.3, -0.8,
+       0.3,  0.1,
+      -0.3,  0.1,
+
+      -0.8,  0.1,
+       0.8,  0.1,
+       0.0,  0.9,
+    ]);
+
+    const vertexBuffer = device.createBuffer({
+      label: "Cell vertices",
+      size: vertices.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(vertexBuffer, /*bufferOffset=*/0, vertices);
+
+    const vertexBufferLayout = {
+      arrayStride: 8,
+      attributes: [{
+        format: "float32x2",
+        offset: 0,
+        shaderLocation: 0, // Position, see vertex shader
+      }],
+    };
+    return {"vertices": vertices, "vertexBuffer" : vertexBuffer, "vertexBufferLayout" : vertexBufferLayout };
+}
+
+function birdShader(birdInfo, gpuInfo, pipelineInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+    const pipelineLayout = pipelineInfo.pipelineLayout;
+      const birdShaderModule = device.createShaderModule({
+        label: "bird shader",
+        code: `
+        const PI = 3.1459;
+
+        struct VertexOutput {
+            @builtin(position) position: vec4f,
+          };
+          struct Uniforms {
+              time: f32,
+              direction: vec2f
+          };
+          struct Bird {
+              position: vec2f,
+              velocity: vec2f
+          };
+
+          @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+          @group(0) @binding(1) var<storage> birdState: array<Bird>;
+
+
+          fn rotate2d(angle: f32) -> mat2x2f {
+                return mat2x2f(cos(angle),-sin(angle),
+                            sin(angle),cos(angle));
+            }
+
+          @vertex
+          fn vertexMain(@location(0) position: vec2f,
+                        @builtin(instance_index) instance: u32) -> VertexOutput {
+            var output: VertexOutput;
+            let bird = birdState[instance];
+
+            let angle = atan2(bird.velocity.x, bird.velocity.y);
+            let rotation = rotate2d(angle);
+            let pos = rotation * position/30  + bird.position;
+            
+            output.position = vec4f(pos, 0, 1);
+            
+            return output;
+          }
+
+          @fragment
+          fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+            return vec4f(1);
+          }
+        `
+      });
+
+      const birdPipeline = device.createRenderPipeline({
+        label: "bird pipeline",
+        layout: pipelineLayout,
+        vertex: {
+          module: birdShaderModule,
+          entryPoint: "vertexMain",
+          buffers: [birdInfo.vertexBufferLayout]
+        },
+        fragment: {
+          module: birdShaderModule,
+          entryPoint: "fragmentMain",
+          targets: [{
+            format: canvasFormat
+          }]
+        }
+      });
+    return birdPipeline;
+}
+
+function simulationShaders(gpuInfo, pipelineInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+    const pipelineLayout = pipelineInfo.pipelineLayout;
+     // Create the compute shader that will process the game of life simulation.
+      const simulationShaderModule = device.createShaderModule({
+        label: "Boids simulation shader",
+        code: `
+          const TURN_FACTOR = 0.04;
+          const VISIBLE_RANGE = 0.2;
+          const PROTECTED_RANGE = 0.08;
+          const CENTERING_FACTOR = 0.0005;
+          const AVOID_FACTOR = 0.10;
+          const MATCHING_FACTOR = 0.05;
+          const MAX_SPEED = 1.3;
+          const MIN_SPEED = 0.5;
+
+          struct Bird { 
+              position: vec2f,
+              velocity: vec2f
+          };
+
+          fn wrap(position : vec2f) -> vec2f {
+            var pos = position;
+            if(abs(position.x) > 1) {
+                pos.x = -pos.x;
+            }
+            if(abs(position.y) > 1) {
+                pos.y = -pos.y;
+            }
+            return pos;
+          }
+
+
+          @group(0) @binding(1) var<storage> birdStateIn: array<Bird>;
+          @group(0) @binding(2) var<storage, read_write> birdStateOut: array<Bird>;
+
+
+          @compute @workgroup_size(${WORKGROUP_SIZE})
+          fn computeMain(@builtin(global_invocation_id) cell: vec3u) {
+            var bird : Bird;
+            bird = birdStateIn[cell.x];
+
+            var pos = bird.position;
+            var vel = bird.velocity; 
+
+            var otherPos: vec2f;
+            var otherVel: vec2f;
+
+            var closeDpos: vec2f;
+            var posAvg: vec2f;
+            var velAvg: vec2f;
+            var neighbors: f32;
+
+            for (var i = 0u; i < arrayLength(&birdStateIn); i++) {
+                if (i == cell.x) {
+                  continue;
+                }
+
+                otherPos = birdStateIn[i].position.xy;
+                otherVel = birdStateIn[i].velocity.xy;
+
+                if (distance(pos, otherPos) < PROTECTED_RANGE) {
+                    closeDpos += pos - otherPos;
+                }
+
+                if (distance(pos, otherPos) < VISIBLE_RANGE) {
+                    velAvg += otherVel;
+                    posAvg += otherPos;
+                    neighbors += 1;
+                }
+            }
+
+            vel += closeDpos * AVOID_FACTOR;
+
+            if(neighbors > 0){
+                velAvg = velAvg/neighbors;
+                vel += (velAvg - vel)*MATCHING_FACTOR;
+                posAvg = posAvg/neighbors;
+                vel += (posAvg - vel)*CENTERING_FACTOR;
+            }
+
+            if (pos.x < -0.9) {
+                vel.x = vel.x + TURN_FACTOR;
+            }
+            if (pos.x > 0.9) {
+                vel.x = vel.x - TURN_FACTOR;
+            }
+            if (pos.y < -0.9) {
+                vel.y = vel.y + TURN_FACTOR;
+            }
+            if (pos.y > 0.9) {
+                vel.y = vel.y - TURN_FACTOR;
+            }
+
+            var speed = length(vel);
+            if(speed < MIN_SPEED) {
+                vel = normalize(vel) * MIN_SPEED;
+            }
+            if(speed > MAX_SPEED) {
+                vel = normalize(vel) * MAX_SPEED;
+            }
+
+            bird.velocity = vel;
+            bird.position = pos + bird.velocity * 0.02;
+
+            birdStateOut[cell.x] = bird;
+          }
+        `
+      });
+
+      // Create a compute pipeline that updates the game state.
+      const simulationPipeline = device.createComputePipeline({
+        label: "Simulation pipeline",
+        layout: pipelineLayout,
+        compute: {
+          module: simulationShaderModule,
+          entryPoint: "computeMain",
+        }
+      });
+    return simulationPipeline;
+}
+
+function pipelineLayout(gpuInfo) {
+    const device = gpuInfo.device;
+
+    // Create the bind group layout and pipeline layout.
+    const bindGroupLayout = device.createBindGroupLayout({
+      label: "Cell Bind Group Layout",
+      entries: [{
+        binding: 0,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE |  GPUShaderStage.FRAGMENT,
+        buffer: {} // test float
+      }, {
+        binding: 1,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+        buffer: { type: "read-only-storage"} // Cell state input buffer
+      }, {
+        binding: 2,
+        visibility: GPUShaderStage.COMPUTE,
+        buffer: { type: "storage"} // Cell state output buffer
+      }]
+    });
+    const pipelineLayout = device.createPipelineLayout({
+      label: "Cell Pipeline Layout",
+      bindGroupLayouts: [ bindGroupLayout ],
+    });
+
+    const uniformBufferSize =
+        2 * 4 + // time is 1 32bit floats + 1 bit padding
+        2 * 4   // mouse is 2 32bit floats
+    const uniformBuffer = device.createBuffer({
+      label: "color Uniform",
+      size: uniformBufferSize,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    const birdStateArray = new Float32Array(4 * BIRD_NUMBER);
+
+    const birdStateStorage = [
+      device.createBuffer({
+        label: "Cell State A",
+        size: birdStateArray.byteLength,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      }),
+      device.createBuffer({
+        label: "Cell State B",
+         size: birdStateArray.byteLength,
+         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      })
+    ];
+
+    for(var i = 0; i < birdStateArray.length; i++) {
+      birdStateArray[i] = Math.random()*2 -1;
+    }
+
+      device.queue.writeBuffer(birdStateStorage[0], 0, birdStateArray);
+      device.queue.writeBuffer(birdStateStorage[1], 0, birdStateArray);
+
+    // Create a bind group to pass the grid uniforms into the pipeline
+    const bindGroups = [
+    device.createBindGroup({
+      label: "Cell renderer bind group A",
+      layout: bindGroupLayout,
+      entries: [{
+        binding: 0,
+        resource: { buffer: uniformBuffer }
+      }, {
+        binding: 1,
+        resource: { buffer: birdStateStorage[0] }
+      }, {
+        binding: 2,
+        resource: { buffer: birdStateStorage[1] }
+      }],
+    }),
+    device.createBindGroup({
+      label: "Cell renderer bind group B",
+      layout: bindGroupLayout,
+      entries: [{
+        binding: 0,
+        resource: { buffer: uniformBuffer }
+      }, {
+        binding: 1,
+        resource: { buffer: birdStateStorage[1] }
+      }, {
+        binding: 2,
+        resource: { buffer: birdStateStorage[0] }
+      }],
+    }),
+    ];
+    return {"pipelineLayout" : pipelineLayout, "bindGroups" :bindGroups, "timeBuffer": uniformBuffer};
+}
+
+function run(renderInfo) {
+    var gpuInfo = renderInfo.gpuInfo;
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+    const context = gpuInfo.context;
+
+    var bird = renderInfo.birdInfo;
+    var pipeline = renderInfo.pipelineInfo;
+    var shaders = renderInfo.shaders;
+
+        const encoder = device.createCommandEncoder();
+
+        // Start a compute pass
+        const computePass = encoder.beginComputePass();
+
+        computePass.setPipeline(shaders.simulationPipeline);
+        computePass.setBindGroup(0, pipeline.bindGroups[step % 2]);
+        const workgroupCount = Math.ceil(BIRD_NUMBER / WORKGROUP_SIZE);
+        computePass.dispatchWorkgroups(workgroupCount);
+        computePass.end();
+
+        step++; // Increment the step count
+
+    const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+            view: context.getCurrentTexture().createView(),
+            clearValue: { r: 0, g: 0, b: 0.4, a: 1 }, // New line
+            loadOp: "clear",
+            storeOp: "store",
+        }]
+    });
+
+    {
+        const uniformValues = new Float32Array(pipeline.timeBuffer.size / 4);
+        var glX = mousePosition.x / width * 2.0 - 1.0;
+        var glY = mousePosition.y / height * -2.0 + 1.0;
+        uniformValues.set([step/10], 0); // time
+        uniformValues.set([glX, glY], 2); //direction
+        device.queue.writeBuffer(pipeline.timeBuffer, 0, uniformValues);
+
+        pass.setPipeline(shaders.birdPipeline);
+        pass.setVertexBuffer(0, bird.vertexBuffer);
+        pass.setBindGroup(0, pipeline.bindGroups[step%2]); // New line!
+
+        pass.draw(bird.vertices.length / 2, BIRD_NUMBER);
+
+    }
+    pass.end();
+    const commandBuffer = encoder.finish();
+    device.queue.submit([commandBuffer]);
+}
+
+var gpuInfo = await init();
+var birdInfo = birdShape(gpuInfo);
+var pipelineInfo = pipelineLayout(gpuInfo);
+var pipelines = {
+                "birdPipeline" : birdShader(birdInfo, gpuInfo, pipelineInfo),
+                "simulationPipeline" : simulationShaders(gpuInfo, pipelineInfo)
+              };
+var renderInfo = {
+    "gpuInfo" : gpuInfo,
+    "birdInfo" : birdInfo,
+    "pipelineInfo" : pipelineInfo,
+    "shaders" : pipelines,
+}
+
+setInterval(function() { run(renderInfo); }, UPDATE_INTERVAL);
+
+    </script>
+  </body>
+</html>
