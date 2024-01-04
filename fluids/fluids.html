@@ -6,30 +6,68 @@
     <title>Fluid simulation</title>
   </head>
   <body>
-    <canvas id="canvas" width="800" height="800"></canvas>
+    <canvas id="canvas" width="4096" height="4096"></canvas>
+    <style>
+#canvas {
+	position:fixed;
+	left:0;
+	top:0;
+	width:100%;
+	height:100%;
+}
+    </style>
     <script type="module">
 
 const DIFFUSE = 0.0;
 const VISCOSITY = 0;
 var DIFFUSE_STATE = DIFFUSE;
-const N = 256;
+const N = 512;
 const GRID_SIZE = N + 2;
-const COLOR_RADIUS = 3;
+const COLOR_RADIUS = 5;
 const VELOCITY_RADIUS = 1;
 
-const WORKGROUP_SIZE = 4;
+const WORKGROUP_SIZE = 16;
 const UPDATE_INTERVAL = 30;
+const DRAW_DENSITY = 1;
+const DRAW_VELOCITY = 2;
+
+var drawState = DRAW_DENSITY;
+
+var pause = false;
+var texture;
+var sampler;
 let step = 0;
 let densityStep = 0;
 let velocityStep = 0;
 var mousePosition = {x : 0, y:0, x0: 0, y0:0 };
+var textureDraw = true;
 var encoder;
 var commandBuffer;
 
 var canvas=document.getElementById("canvas");
-var width = canvas.width;
-var height = canvas.height;
+var width = canvas.clientWidth;
+var height = canvas.clientHeight;
 let timer
+
+function keypress(e) {
+    var key = e.key;
+    if(key == "p") {
+        pause = !pause;
+    }
+    if(key == "a") {
+        textureDraw = !textureDraw;
+    }
+    if(key == "s") {
+        if(drawState == DRAW_DENSITY) {
+            drawState  = DRAW_VELOCITY;
+        } else {
+            drawState  = DRAW_DENSITY;
+        }
+    }
+}
+
+window.addEventListener('keydown',keypress,false);
+
 canvas.addEventListener('mousemove', function(e) {
     var newPos = getMousePos(canvas, e);
     mousePosition.x0 = mousePosition.x;
@@ -109,7 +147,95 @@ function squareShape(gpuInfo) {
     return {"vertices": vertices, "vertexBuffer" : vertexBuffer, "vertexBufferLayout" : vertexBufferLayout };
 }
 
-function createSquarePipeline(squareInfo, gpuInfo, pipelineInfo) {
+function createTexturePipeline(pipelineInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+      const shaderModule = device.createShaderModule({
+        label: "create texture shader",
+        code: `
+          struct Uniforms {
+              mouse: vec2f,
+              grid_size: vec2f,
+              diff: f32, visc: f32,
+              N: f32, dt: f32, b: f32,
+          };
+
+	  fn IX(x: u32, y: u32) -> u32 {
+	    var grid = uniforms.grid_size;
+	    return y * u32(grid.x) + x;
+	  }
+        @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+        @group(0) @binding(1) var out_texture: texture_storage_2d<rgba8unorm, write>;
+        @group(0) @binding(2) var<storage> stateIn: array<vec4f>;
+
+        @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+        fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
+	   var index = IX(global_id.x+1, global_id.y+1);
+	   var color = stateIn[index];
+	   textureStore(out_texture, vec2<u32>(global_id.x, global_id.y), vec4<f32>(color.rgb, 1.0));
+	}
+        `
+      });
+
+	  sampler = device.createSampler({
+	    magFilter: 'linear',
+	    minFilter: 'linear',
+	    //magFilter: 'nearest',
+	    //minFilter: 'nearest',
+	  });
+
+	texture = device.createTexture({
+	      size: {
+            width: N,
+            height: N,
+	      },
+	      format: 'rgba8unorm',
+	      usage:
+		GPUTextureUsage.COPY_DST |
+		GPUTextureUsage.STORAGE_BINDING |
+		GPUTextureUsage.TEXTURE_BINDING,
+	    });
+
+        const bindGroupLayout = device.createBindGroupLayout({
+          label: "Add Density Bind Group Layout",
+          entries: [
+              {
+                binding: 0,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: {}
+              },
+	      {
+		binding: 1,
+                visibility: GPUShaderStage.COMPUTE ,
+                storageTexture: { format: "rgba8unorm" }
+	      },
+              {
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE ,
+                buffer: { type: "read-only-storage"}
+              },
+            ]
+        });
+        const pipelineLayout = device.createPipelineLayout({
+          label: "Square Pipeline Layout",
+          bindGroupLayouts: [ bindGroupLayout ]
+        });
+
+
+      // Create a compute pipeline that updates the game state.
+      const pipeline = device.createComputePipeline({
+        label: "set_bnd pipeline",
+        layout: pipelineLayout,
+        compute: {
+          module: shaderModule,
+          entryPoint: "computeMain",
+        }
+      });
+
+    return { layout : bindGroupLayout, program: pipeline };
+}
+
+function createDrawBufferPipeline(squareInfo, gpuInfo, pipelineInfo) {
     const device = gpuInfo.device;
     const canvasFormat = gpuInfo.canvasFormat;
       const squareShaderModule = device.createShaderModule({
@@ -132,7 +258,12 @@ function createSquarePipeline(squareInfo, gpuInfo, pipelineInfo) {
           };
 
           @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-          @group(0) @binding(1) var<storage> colorSource: array<vec4f>;
+          @group(0) @binding(1) var<storage> buffer: array<vec4f>;
+
+          fn IX(x: u32, y: u32) -> u32 {
+            var grid = uniforms.grid_size;
+            return y * u32(grid.x) + x;
+          }
 
           @vertex
           fn vertexMain(input: VertexInput,
@@ -144,14 +275,10 @@ function createSquarePipeline(squareInfo, gpuInfo, pipelineInfo) {
           }
 
           @fragment
-          fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
-            var cell = floor(input.uv * uniforms.N);
-            var i = cell.x + 1;
-            var j = cell.y + 1;
-            var index = i32(i + j * uniforms.grid_size.x);
-            var color = colorSource[index]; 
-            return vec4f(color);
-            //return vec4(0.5) + 0.5 * vec4f(color);
+              fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+                var id = vec2u((floor(input.uv * uniforms.N)));
+                var index = IX(id.x + 1, id.y + 1) ;
+              return buffer[index];
           }
         `
       });
@@ -168,6 +295,96 @@ function createSquarePipeline(squareInfo, gpuInfo, pipelineInfo) {
             binding: 1,
             visibility: GPUShaderStage.VERTEX |  GPUShaderStage.FRAGMENT,
             buffer: { type: "read-only-storage"}
+          },
+            ]
+        });
+        const pipelineLayout = device.createPipelineLayout({
+          label: "Square Pipeline Layout",
+          bindGroupLayouts: [ bindGroupLayout ]
+        });
+
+
+      // Create a pipeline that renders the cell.
+      const squarePipeline = device.createRenderPipeline({
+        label: "square pipeline",
+        layout: pipelineLayout,
+        vertex: {
+          module: squareShaderModule,
+          entryPoint: "vertexMain",
+          buffers: [squareInfo.vertexBufferLayout]
+        },
+        fragment: {
+          module: squareShaderModule,
+          entryPoint: "fragmentMain",
+          targets: [{
+            format: canvasFormat
+          }]
+        }
+      });
+    return { layout : bindGroupLayout, program: squarePipeline };
+}
+
+
+function createDrawTexturePipeline(squareInfo, gpuInfo, pipelineInfo) {
+    const device = gpuInfo.device;
+    const canvasFormat = gpuInfo.canvasFormat;
+      const squareShaderModule = device.createShaderModule({
+        label: "square shader",
+        code: `
+          struct VertexInput {
+            @location(0) position: vec2f,
+            @location(1) uv: vec2f,
+          };
+          struct VertexOutput {
+            @builtin(position) position: vec4f,
+            @location(0) uv: vec2f,
+          };
+
+          struct Uniforms {
+              mouse: vec2f,
+              grid_size: vec2f,
+              diff: f32, visc: f32,
+              N: f32, dt: f32, b: f32,
+          };
+
+          @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+          @group(0) @binding(1) var myTexture : texture_2d<f32>;
+          @group(0) @binding(2) var mySampler : sampler;
+
+
+          @vertex
+          fn vertexMain(input: VertexInput,
+                        @builtin(instance_index) instance: u32) -> VertexOutput {
+            var output: VertexOutput;
+            output.position = vec4f(input.position, 0, 1);
+            output.uv = input.uv;
+            return output;
+          }
+
+          @fragment
+          fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+          return textureSample(myTexture, mySampler, input.uv);
+          }
+        `
+      });
+
+        const bindGroupLayout = device.createBindGroupLayout({
+          label: "Square Bind Group Layout",
+          entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.VERTEX |  GPUShaderStage.FRAGMENT,
+            buffer: {}
+          },
+          {
+            binding: 1,
+            visibility: GPUShaderStage.VERTEX |  GPUShaderStage.FRAGMENT,
+            texture: { }
+          },
+          {
+            binding: 2,
+            visibility: GPUShaderStage.VERTEX |  GPUShaderStage.FRAGMENT,
+            sampler: { }
           }
             ]
         });
@@ -810,7 +1027,7 @@ function setUniforms(renderInfo, b){
     var device = renderInfo.gpuInfo.device;
     var uniformBuffer = renderInfo.buffers.uniformBuffer;
     var mouseX = mousePosition.x/width * GRID_SIZE;
-    var mouseY = (1.0 - mousePosition.y/width) * GRID_SIZE;
+    var mouseY = (1.0 - mousePosition.y/height) * GRID_SIZE;
     var dt = UPDATE_INTERVAL / 1000;
     var uniformArray = new Float32Array([
         mouseX, mouseY,
@@ -1136,16 +1353,15 @@ function density(renderInfo) {
     var dx = mousePosition.x - mousePosition.x0;
     var dy = -1 * (mousePosition.y - mousePosition.y0);
 
-    var r = 0.5 + 0.4 * Math.sin(step/100)
-    var g = 0.5 + 0.4 * Math.sin(step/30)
-    var b = 0.5 + 0.4 * Math.sin(step/50)
+    var r = 0.6 + 0.4 * Math.sin(step/20)
+    var g = 0.6 + 0.4 * Math.cos(step/25)
+    var b = 0.6 + 0.4 * Math.sin(step/50)
 
     var addSourceArr = new Float32Array([
         r, g, b, 1,
         COLOR_RADIUS, 0, 0, 0
     ]);
 
-    console.log(dx + ", " + dy);
     if(dx != 0 || dy != 0) {
         device.queue.writeBuffer(buffers.addDensityBuffer, 0, addSourceArr);
         addSource(renderInfo, densityBuffers[densityStep % 2], densityBuffers[(densityStep+1) % 2], buffers.addDensityBuffer);
@@ -1160,16 +1376,16 @@ function density(renderInfo) {
 }
 
 
-function drawDensity(renderInfo) {
+function drawTexture(renderInfo) {
     var square = renderInfo.squareInfo;
     var buffers = renderInfo.buffers;
-    var squarePipeline = renderInfo.shaders.squarePipeline;
+    var pipeline = renderInfo.shaders.drawTexturePipeline;
     var device = renderInfo.gpuInfo.device;
     var context = renderInfo.gpuInfo.context;
     
     var bindGroup = device.createBindGroup({
           label: "Cell renderer bind group A",
-          layout: squarePipeline.layout,
+          layout: pipeline.layout,
           entries: [
               {
                 binding: 0,
@@ -1177,8 +1393,12 @@ function drawDensity(renderInfo) {
               },
               {
                 binding: 1,
-                resource: { buffer: buffers.densityBuffers[densityStep%2] }
+                resource: texture.createView(),
               },
+	      {
+		binding: 2,
+		resource: sampler,
+	      },
             ],
         });
 
@@ -1195,7 +1415,7 @@ function drawDensity(renderInfo) {
     });
 
 
-    pass.setPipeline(squarePipeline.program);
+    pass.setPipeline(pipeline.program);
     pass.setVertexBuffer(0, square.vertexBuffer);
     pass.setBindGroup(0, bindGroup);
     pass.draw(square.vertices.length / 4, 1);
@@ -1204,16 +1424,17 @@ function drawDensity(renderInfo) {
     device.queue.submit([commandBuffer]);
 }
 
-function drawVelocity(renderInfo) {
+function drawBuffer(renderInfo, buffer) {
+    console.log("DRAWING BUFFER")
     var square = renderInfo.squareInfo;
     var buffers = renderInfo.buffers;
-    var squarePipeline = renderInfo.shaders.squarePipeline;
+    var pipeline = renderInfo.shaders.drawBufferPipeline;
     var device = renderInfo.gpuInfo.device;
     var context = renderInfo.gpuInfo.context;
     
     var bindGroup = device.createBindGroup({
           label: "Cell renderer bind group A",
-          layout: squarePipeline.layout,
+          layout: pipeline.layout,
           entries: [
               {
                 binding: 0,
@@ -1221,7 +1442,7 @@ function drawVelocity(renderInfo) {
               },
               {
                 binding: 1,
-                resource: { buffer: buffers.velocityBuffers[velocityStep%2] }
+                resource: { buffer: buffer }
               },
             ],
         });
@@ -1238,13 +1459,61 @@ function drawVelocity(renderInfo) {
         }]
     });
 
-    pass.setPipeline(squarePipeline.program);
+    pass.setPipeline(pipeline.program);
     pass.setVertexBuffer(0, square.vertexBuffer);
     pass.setBindGroup(0, bindGroup);
     pass.draw(square.vertices.length / 4, 1);
     pass.end();
     commandBuffer = encoder.finish();
     device.queue.submit([commandBuffer]);
+}
+
+function createTexture(renderInfo, buffer){
+    var square = renderInfo.squareInfo;
+    var buffers = renderInfo.buffers;
+    var pipeline = renderInfo.shaders.createTexturePipeline;
+    var device = renderInfo.gpuInfo.device;
+    var context = renderInfo.gpuInfo.context;
+    
+    var bindGroup = device.createBindGroup({
+          label: "Cell renderer bind group A",
+          layout: pipeline.layout,
+          entries: [
+              {
+                binding: 0,
+                resource: { buffer: buffers.uniformBuffer }
+              },
+              {
+                binding: 1,
+                resource: texture.createView()
+              },
+              {
+                binding: 2,
+                resource: { buffer: buffer }
+              },
+            ],
+        });
+
+
+    encoder = device.createCommandEncoder();
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(pipeline.program);
+    computePass.setBindGroup(0, bindGroup);
+    const workgroupCount = Math.ceil(N / WORKGROUP_SIZE);
+    computePass.dispatchWorkgroups(workgroupCount, workgroupCount);
+    computePass.end();
+    commandBuffer = encoder.finish();
+    device.queue.submit([commandBuffer]);
+}
+
+function getDrawBuffer(renderInfo) {
+    var buffers = renderInfo.buffers;
+    if(drawState == DRAW_DENSITY) {
+        return buffers.densityBuffers[densityStep%2];
+    }
+    if(drawState == DRAW_VELOCITY) {
+        return buffers.velocityBuffers[velocityStep%2];
+    }
 }
 
 function run(renderInfo) {
@@ -1253,20 +1522,22 @@ function run(renderInfo) {
     var encoder;
     var commandBuffer;
 
-    //encoder = device.createCommandEncoder();
-    //commandBuffer = encoder.finish();
-    //device.queue.submit([commandBuffer]);
-
-
     setUniforms(renderInfo, 0);
 
-    density(renderInfo);
+    if (!pause) {
+        density(renderInfo);
 
-    velocity(renderInfo);
+        velocity(renderInfo);
+    }
 
-    drawDensity(renderInfo);
+    var buffer = getDrawBuffer(renderInfo);
 
-    //drawVelocity(renderInfo);
+    if(textureDraw) {
+        createTexture(renderInfo, buffer);
+        drawTexture(renderInfo);
+    } else {
+        drawBuffer(renderInfo, buffer);
+    }
 
     step++;
 }
@@ -1339,7 +1610,8 @@ var gpuInfo = await init();
 var squareInfo = squareShape(gpuInfo);
 var buffers = createBuffers(gpuInfo);
 var pipelines = {
-                    "squarePipeline" : createSquarePipeline(squareInfo, gpuInfo),
+                    "drawTexturePipeline" : createDrawTexturePipeline(squareInfo, gpuInfo),
+                    "drawBufferPipeline" : createDrawBufferPipeline(squareInfo, gpuInfo),
                     "addDensityPipeline" : createAddDensityPipeline(gpuInfo),
                     "diffusePipeline" : createDiffusePipeline(gpuInfo),
                     "advectPipeline" : createAdvectPipeline(gpuInfo),
@@ -1347,6 +1619,7 @@ var pipelines = {
                     "projectPipeline_2" : createProjectPipeline_2(gpuInfo),
                     "projectPipeline_3" : createProjectPipeline_3(gpuInfo),
                     "bndPipeline" : createBndPipeline(gpuInfo),
+                    "createTexturePipeline" : createTexturePipeline(gpuInfo),
                 };
 
 
